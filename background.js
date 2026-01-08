@@ -35,6 +35,87 @@ const GROUP_TABS_FROM_THIS_DOMAON_ACTION = {
 
 const ALL_ACTIONS = [DO_NOTHING, MERGE_AND_SORT_ACTION, MERGE_ACTION, SORT_ACTION, CLOSE_TABS_FROM_THIS_DOMAIN_ACTION, MOVE_TABS_FROM_THIS_DOMAIN_ACTION, GROUP_TABS_FROM_THIS_DOMAON_ACTION]
 
+function safeDecodeURIComponent(value) {
+  try {
+    return decodeURIComponent(value)
+  } catch (error) {
+    return value
+  }
+}
+
+function looksLikeWebUrl(value) {
+  if (!value) {
+    return false
+  }
+  return /^https?:\/\//i.test(value)
+}
+
+function isSuspendedWrapperUrl(rawUrl) {
+  if (!rawUrl) {
+    return false
+  }
+  try {
+    const url = new URL(rawUrl)
+    return url.protocol === "chrome-extension:" && /\/suspended\.html$/i.test(url.pathname)
+  } catch (error) {
+    return false
+  }
+}
+
+function extractOriginalUrlFromSuspender(rawUrl) {
+  try {
+    const url = new URL(rawUrl)
+    const hash = (url.hash || "").startsWith("#") ? url.hash.slice(1) : (url.hash || "")
+    const params = new URLSearchParams(hash)
+    const candidateKeys = ["uri", "url", "originalUrl", "original_url"]
+
+    for (const key of candidateKeys) {
+      const value = params.get(key)
+      if (!value) {
+        continue
+      }
+      const decodedValue = safeDecodeURIComponent(value)
+      if (looksLikeWebUrl(decodedValue)) {
+        return decodedValue
+      }
+      if (looksLikeWebUrl(value)) {
+        return value
+      }
+    }
+
+    return null
+  } catch (error) {
+    return null
+  }
+}
+
+function getEffectiveTabUrl(tabOrUrl) {
+  const rawUrl = typeof tabOrUrl === "string" ? tabOrUrl : tabOrUrl?.url
+  if (!rawUrl) {
+    return ""
+  }
+  if (isSuspendedWrapperUrl(rawUrl)) {
+    const originalUrl = extractOriginalUrlFromSuspender(rawUrl)
+    if (originalUrl) {
+      return originalUrl
+    }
+  }
+  return rawUrl
+}
+
+function getEffectiveHostname(tabOrUrl) {
+  const effectiveUrl = getEffectiveTabUrl(tabOrUrl)
+  try {
+    return new URL(effectiveUrl).hostname
+  } catch (error) {
+    return ""
+  }
+}
+
+function getSuspendedSortWeight(tab) {
+  return isSuspendedWrapperUrl(tab?.url) ? 1 : 0
+}
+
 async function getOptions() {
   return await chrome.storage.sync.get({
     defaultAction: MERGE_AND_SORT_ACTION.id,
@@ -45,14 +126,14 @@ async function getOptions() {
   })
 }
 
-async function getTabsFromDomain(url) {
+async function getTabsFromDomain(tab) {
   let options = await getOptions()
   let tabs = await chrome.tabs.query({
     groupId: chrome.tabGroups.TAB_GROUP_ID_NONE,
-    url: url.protocol + "//" + url.host + "/*",
     pinned: options.ignorePinnedTabs ? false : undefined,
   })
-  return tabs
+  const hostname = getEffectiveHostname(tab)
+  return tabs.filter(candidateTab => getEffectiveHostname(candidateTab) === hostname)
 }
 
 function baseAction(actionId) {
@@ -88,8 +169,7 @@ async function sortTabsAction() {
 
 async function closeTabsFromCurrentDomainAction() {
   let selectedTab = (await chrome.tabs.query({ active: true, currentWindow: true }))[0]
-  let url = new URL(selectedTab.url)
-  let tabs = await getTabsFromDomain(url)
+  let tabs = await getTabsFromDomain(selectedTab)
   for (let tab of tabs) {
     await chrome.tabs.remove(tab.id)
   }
@@ -97,8 +177,7 @@ async function closeTabsFromCurrentDomainAction() {
 
 async function moveTabsFromCurrentDomainAction() {
   let selectedTab = (await chrome.tabs.query({ active: true, currentWindow: true }))[0]
-  let url = new URL(selectedTab.url)
-  let tabs = await getTabsFromDomain(url)
+  let tabs = await getTabsFromDomain(selectedTab)
   for (let tab of tabs) {
     await chrome.tabs.move(tab.id, { windowId: selectedTab.windowId, index: -1 })
     if (tab.pinned == true) {
@@ -109,16 +188,16 @@ async function moveTabsFromCurrentDomainAction() {
 
 async function groupTabsFromCurrentDomainAction() {
   let selectedTab = (await chrome.tabs.query({ active: true, currentWindow: true }))[0]
-  let url = new URL(selectedTab.url)
-  let tabs = await getTabsFromDomain(url)
+  let tabs = await getTabsFromDomain(selectedTab)
   let tabIds = tabs.map(tab => tab.id)
-  let existingGroups = await chrome.tabGroups.query({ title: url.host })
+  let hostname = getEffectiveHostname(selectedTab)
+  let existingGroups = await chrome.tabGroups.query({ title: hostname })
   if (existingGroups.length > 0) {
     let existingGroupId = existingGroups[0].id
     await chrome.tabs.group({ groupId: existingGroupId, tabIds: tabIds })
   } else {
     let groupId = await chrome.tabs.group({ tabIds: tabIds })
-    await chrome.tabGroups.update(groupId, { title: url.host })
+    await chrome.tabGroups.update(groupId, { title: hostname })
   }
 }
 
@@ -170,12 +249,14 @@ async function sortTabs() {
     } else if (a.groupId > b.groupId) {
       return 1
     } else {
-      if (a.url < b.url) {
+      const aUrl = getEffectiveTabUrl(a)
+      const bUrl = getEffectiveTabUrl(b)
+      if (aUrl < bUrl) {
         return -1
-      } else if (a.url > b.url) {
+      } else if (aUrl > bUrl) {
         return 1
       } else {
-        return 0
+        return getSuspendedSortWeight(a) - getSuspendedSortWeight(b)
       }
     }
   })
