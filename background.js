@@ -292,7 +292,13 @@ chrome.runtime.onInstalled.addListener(() => {
       "title": action.title,
       "id": action.id,
       contexts: ["action"],
-    });
+    })
+    if (action === SORT_ACTION || action === MOVE_TABS_FROM_THIS_DOMAIN_ACTION) {
+      chrome.contextMenus.create({
+        type: "separator",
+        contexts: ["action"],
+      })
+    }
   }
 
   getOptions().then(options => {
